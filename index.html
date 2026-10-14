@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<title>کتابخانه PDF</title>
+<style>
+  :root{--bg:#f4f4f5;--fg:#18181b;--card:#fff;--bar:#e4e4e7;--accent:#2563eb;--on:#fff;--mut:#71717a}
+  @media(prefers-color-scheme:dark){:root{--bg:#18181b;--fg:#e4e4e7;--card:#27272a;--bar:#3f3f46;--accent:#60a5fa;--on:#0b1220;--mut:#a1a1aa}}
+  *{box-sizing:border-box}
+  [hidden]{display:none!important}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Vazirmatn,Tahoma,sans-serif}
+  header{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+    padding:10px 14px;padding-top:calc(10px + env(safe-area-inset-top));background:var(--bar)}
+  header .sp{flex:1}
+  header strong{font-size:16px}
+  button,select,label.btn{font:inherit;font-size:14px;border:0;border-radius:8px;padding:8px 12px;cursor:pointer;
+    background:var(--accent);color:var(--on)}
+  select{background:var(--card);color:var(--fg)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;padding:14px;max-width:1000px;margin:0 auto}
+  .card{background:var(--card);border-radius:12px;padding:14px;cursor:pointer;display:flex;flex-direction:column;gap:8px;
+    box-shadow:0 1px 4px #0002}
+  .card h3{margin:0;font-size:15px;line-height:1.5;word-break:break-word;direction:auto;unicode-bidi:plaintext}
+  .meta{font-size:12px;color:var(--mut)}
+  .prog{height:4px;background:var(--bar);border-radius:2px;overflow:hidden}
+  .prog i{display:block;height:100%;background:var(--accent)}
+  .del{background:transparent;color:var(--mut);padding:2px 0;align-self:flex-start;font-size:12px}
+  .empty{text-align:center;padding:90px 20px;color:var(--mut)}
+  #view{max-width:900px;margin:16px auto;padding:0 10px 70px}
+  .pg{margin:0 auto 16px}
+  .pg.reader{background:var(--card);border-radius:8px;padding:22px;line-height:1.8;font-size:17px;min-height:180px}
+  .pg.reader h4{margin:0 0 12px;font-size:12px;color:var(--mut);font-weight:500}
+  .pg.reader p{margin:0 0 1em;unicode-bidi:plaintext}
+  .pg.original{position:relative;background:#fff;box-shadow:0 1px 6px #0003;overflow:hidden}
+  .pg.original canvas{display:block;width:100%;height:100%}
+  .textLayer{position:absolute;top:0;left:0;overflow:hidden;line-height:1;direction:ltr}
+  .textLayer span{position:absolute;white-space:pre;color:transparent;transform-origin:0 0;cursor:text}
+  .textLayer ::selection{background:#2563eb55}
+  #bar{position:fixed;bottom:calc(12px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);
+    background:#000b;color:#fff;font-size:13px;padding:6px 14px;border-radius:20px;pointer-events:none}
+</style>
+</head>
+<body>
+<header translate="no">
+  <button id="back" hidden>→ کتابخانه</button>
+  <strong id="title">کتابخانه PDF</strong>
+  <span class="sp"></span>
+  <select id="mode" hidden>
+    <option value="reader">حالت خواندن (بهترین برای ترجمه)</option>
+    <option value="original">چیدمان اصلی</option>
+  </select>
+  <select id="lang" hidden title="زبان سند">
+    <option value="en">زبان سند: English</option>
+    <option value="de">Deutsch</option><option value="fr">Français</option>
+    <option value="es">Español</option><option value="ru">Русский</option>
+    <option value="ar">العربية</option><option value="zh">中文</option>
+    <option value="ja">日本語</option><option value="fa">فارسی</option>
+    <option value="">تشخیص خودکار</option>
+  </select>
+  <label class="btn" id="addBtn">+ افزودن PDF<input id="file" type="file" accept="application/pdf,.pdf" multiple hidden></label>
+</header>
+<main id="lib" translate="no"></main>
+<main id="view" hidden></main>
+<div id="bar" translate="no" hidden>صفحه <span id="cur">1</span> از <span id="tot">1</span></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* ---------- IndexedDB: "meta" (small) and "files" (PDF blobs) ---------- */
+const dbp = new Promise((res, rej) => {
+  const r = indexedDB.open("pdflib", 1);
+  r.onupgradeneeded = () => { r.result.createObjectStore("meta", { keyPath: "id" }); r.result.createObjectStore("files"); };
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const req = (store, mode, fn) => dbp.then(db => new Promise((res, rej) => {
+  const t = db.transaction(store, mode), r = fn(t.objectStore(store));
+  t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error);
+}));
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now() + "-" + Math.random().toString(36).slice(2));
+
+/* ---------- PDF.js loader: local vendor/ first, CDN fallback ---------- */
+let pdfReady = null;
+function loadScript(src) {
+  return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = rej; document.head.append(s); });
+}
+function ensurePdfJs() {
+  if (pdfReady) return pdfReady;
+  pdfReady = (async () => {
+    const bases = ["vendor/", "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/"];
+    for (const base of bases) {
+      try {
+        await loadScript(base + "pdf.min.js");
+        const w = new URL(base + "pdf.worker.min.js", location.href).href;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = base.startsWith("http")
+          ? URL.createObjectURL(new Blob([`importScripts("${w}")`], { type: "text/javascript" })) : w;
+        return;
+      } catch (e) {}
+    }
+    pdfReady = null; throw new Error("PDF.js not found");
+  })();
+  return pdfReady;
+}
+
+/* ---------- State ---------- */
+let pdf = null, cur = null, token = 0, renderObs = null, posObs = null, rendered = new Set(), saveT = 0, curPage = 1;
+$("mode").value = localStorage.getItem("mode") || "reader";
+$("lang").value = localStorage.getItem("lang") ?? "en";
+
+/* ---------- Library ---------- */
+async function showLib() {
+  pdf = null; cur = null; token++; disconnect();
+  $("lib").hidden = false; $("view").hidden = true; $("bar").hidden = true;
+  $("back").hidden = $("mode").hidden = $("lang").hidden = true; $("addBtn").hidden = false;
+  $("title").textContent = document.title = "کتابخانه PDF";
+  const list = (await req("meta", "readonly", s => s.getAll())).sort((a, b) => (b.opened || b.added) - (a.opened || a.added));
+  const lib = $("lib"); lib.innerHTML = "";
+  if (!list.length) { lib.innerHTML = '<div class="empty">هنوز کتابی اضافه نکرده‌ای.<br>با «افزودن PDF» شروع کن.</div>'; return; }
+  const grid = document.createElement("div"); grid.className = "grid";
+  for (const b of list) {
+    const c = document.createElement("div"); c.className = "card";
+    const pct = b.pages ? Math.round(b.lastPage / b.pages * 100) : 0;
+    c.innerHTML = `<h3></h3><div class="meta"></div><div class="prog"><i style="width:${pct}%"></i></div><button class="del">حذف</button>`;
+    c.querySelector("h3").textContent = b.name;
+    c.querySelector(".meta").textContent = (b.size / 1048576).toFixed(1) + " MB" + (b.pages ? ` · صفحه ${b.lastPage} از ${b.pages}` : "");
+    c.onclick = () => openBook(b.id);
+    c.querySelector(".del").onclick = async ev => {
+      ev.stopPropagation(); if (!confirm("این کتاب حذف شود؟")) return;
+      await req("meta", "readwrite", s => s.delete(b.id)); await req("files", "readwrite", s => s.delete(b.id)); showLib();
+    };
+    grid.append(c);
+  }
+  lib.append(grid);
+}
+
+$("file").onchange = async e => {
+  for (const f of e.target.files) {
+    const id = uid();
+    await req("files", "readwrite", s => s.put(f, id));
+    await req("meta", "readwrite", s => s.put({ id, name: f.name.replace(/\.pdf$/i, ""), size: f.size, added: Date.now(), lastPage: 1, pages: 0 }));
+  }
+  e.target.value = ""; showLib();
+};
+$("back").onclick = showLib;
+
+/* ---------- Reader ---------- */
+async function openBook(id) {
+  try {
+    await ensurePdfJs();
+    const meta = await req("meta", "readonly", s => s.get(id));
+    const blob = await req("files", "readonly", s => s.get(id));
+    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(await blob.arrayBuffer()) }).promise;
+    cur = meta; cur.pages = pdf.numPages; cur.opened = Date.now();
+    await req("meta", "readwrite", s => s.put(cur));
+    $("lib").hidden = true; $("view").hidden = false; $("bar").hidden = false;
+    $("back").hidden = $("mode").hidden = $("lang").hidden = false; $("addBtn").hidden = true;
+    $("title").textContent = meta.name; document.title = meta.name;
+    $("tot").textContent = pdf.numPages;
+    build();
+  } catch (e) { alert("خطا در باز کردن فایل: " + e.message); }
+}
+
+function disconnect() { renderObs && renderObs.disconnect(); posObs && posObs.disconnect(); }
+function applyLang(el) { const l = $("lang").value; l ? el.setAttribute("lang", l) : el.removeAttribute("lang"); }
+
+async function build() {
+  const my = ++token, mode = $("mode").value, view = $("view");
+  disconnect(); view.innerHTML = ""; rendered = new Set();
+  const first = await pdf.getPage(1), v = first.getViewport({ scale: 1 });
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const d = document.createElement("section");
+    d.className = "pg " + mode; d.dataset.n = n; applyLang(d);
+    if (mode === "original") d.style.aspectRatio = v.width + "/" + v.height;
+    view.append(d);
+  }
+  const start = Math.min(cur.lastPage || 1, pdf.numPages);
+  await renderPage(start);
+  if (my !== token) return;
+  const target = view.children[start - 1];
+  target.scrollIntoView(); setTimeout(() => target.scrollIntoView(), 300);
+  setCur(start, false);
+  renderObs = new IntersectionObserver(es => es.forEach(e => e.isIntersecting && renderPage(+e.target.dataset.n)), { rootMargin: "1200px 0px" });
+  posObs = new IntersectionObserver(es => es.forEach(e => e.isIntersecting && setCur(+e.target.dataset.n, true)), { rootMargin: "-49% 0px -49% 0px" });
+  setTimeout(() => { if (my === token) for (const d of view.children) { renderObs.observe(d); posObs.observe(d); } }, 500);
+}
+
+function setCur(n, save) {
+  curPage = n; $("cur").textContent = n;
+  if (!save || !cur) return;
+  cur.lastPage = n; clearTimeout(saveT);
+  saveT = setTimeout(() => req("meta", "readwrite", s => s.put(cur)).catch(() => {}), 600);
+}
+
+async function renderPage(n) {
+  if (rendered.has(n)) return; rendered.add(n);
+  const my = token, div = $("view").children[n - 1]; if (!div) return;
+  try {
+    const page = await pdf.getPage(n);
+    if (my !== token) return;
+    $("mode").value === "reader" ? await renderReader(page, n, div) : await renderOriginal(page, n, div);
+  } catch (e) { rendered.delete(n); }
+}
+
+async function renderReader(page, n, div) {
+  const tc = await page.getTextContent(), paras = [];
+  let t = "", lastY = null, lastH = 10;
+  for (const it of tc.items) {
+    if (!it.str && !it.hasEOL) continue;
+    const y = it.transform[5], h = it.height || lastH;
+    if (lastY !== null) {
+      const gap = Math.abs(lastY - y);
+      if (gap > h * 1.8) { if (t.trim()) paras.push(t.trim()); t = ""; }
+      else if (gap > 2 && t && !/\s$/.test(t)) t += " ";
+    }
+    t += it.str;
+    if (it.hasEOL && t && !/[\s-]$/.test(t)) t += " ";
+    lastY = y; lastH = h;
+  }
+  if (t.trim()) paras.push(t.trim());
+  div.innerHTML = "";
+  const h = document.createElement("h4"); h.setAttribute("translate", "no"); h.textContent = "صفحه " + n; div.append(h);
+  if (!paras.length) { const p = document.createElement("p"); p.setAttribute("translate", "no"); p.textContent = "متنی در این صفحه نیست (احتمالاً اسکن‌شده است)."; div.append(p); }
+  for (const s of paras) { const p = document.createElement("p"); p.dir = "auto"; p.textContent = s.replace(/-\s+(?=[a-z])/g, ""); div.append(p); }
+}
+
+async function renderOriginal(page, n, div) {
+  const css = 1.5, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const vp = page.getViewport({ scale: css }), vh = page.getViewport({ scale: css * dpr });
+  div.style.aspectRatio = vp.width + "/" + vp.height; div.innerHTML = "";
+  const cv = document.createElement("canvas"); cv.width = vh.width; cv.height = vh.height; div.append(cv);
+  const layer = document.createElement("div"); layer.className = "textLayer";
+  layer.style.cssText = `width:${vp.width}px;height:${vp.height}px;transform-origin:0 0`;
+  layer.style.setProperty("--scale-factor", css); applyLang(layer); div.append(layer);
+  div._fit = () => { layer.style.transform = `scale(${div.clientWidth / vp.width})`; }; div._fit();
+  await page.render({ canvasContext: cv.getContext("2d"), viewport: vh }).promise;
+  const tc = await page.getTextContent();
+  await pdfjsLib.renderTextLayer({ textContentSource: tc, container: layer, viewport: vp, textDivs: [] }).promise;
+}
+
+$("mode").onchange = () => { localStorage.setItem("mode", $("mode").value); if (pdf) { cur.lastPage = curPage; build(); } };
+$("lang").onchange = () => { localStorage.setItem("lang", $("lang").value); document.querySelectorAll(".pg, .textLayer").forEach(applyLang); };
+addEventListener("resize", () => document.querySelectorAll(".pg.original").forEach(d => d._fit && d._fit()));
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+showLib();
+</script>
+</body>
+</html>
