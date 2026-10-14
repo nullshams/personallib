@@ -1,4 +1,4 @@
-const V = "pdflib-v1"; // bump this to force clients to update
+const V = "pdflib-v2"; // bump this to force clients to update
 const SHELL = ["./", "index.html", "manifest.webmanifest", "icons/icon-180.png", "icons/icon-192.png", "icons/icon-512.png",
   "vendor/pdf.min.js", "vendor/pdf.worker.min.js"];
 
