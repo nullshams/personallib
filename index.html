@@ -51,8 +51,13 @@
   <strong id="title">کتابخانه PDF</strong>
   <span class="sp"></span>
   <select id="mode" hidden>
-    <option value="reader">حالت خواندن (بهترین برای ترجمه)</option>
+    <option value="reader">حالت خواندن (مناسب ترجمه)</option>
     <option value="original">چیدمان اصلی</option>
+  </select>
+  <select id="fix" hidden title="اصلاح متن فارسی/عربی برعکس‌شده">
+    <option value="auto">متن فارسی: خودکار</option>
+    <option value="on">متن فارسی: اصلاح (برعکس)</option>
+    <option value="off">متن فارسی: بدون تغییر</option>
   </select>
   <select id="lang" hidden title="زبان سند">
     <option value="en">زبان سند: English</option>
@@ -111,12 +116,14 @@ function ensurePdfJs() {
 let pdf = null, cur = null, token = 0, renderObs = null, posObs = null, rendered = new Set(), saveT = 0, curPage = 1;
 $("mode").value = localStorage.getItem("mode") || "reader";
 $("lang").value = localStorage.getItem("lang") ?? "en";
+$("fix").value = localStorage.getItem("fix") || "auto";
+let rtlFix = false;
 
 /* ---------- Library ---------- */
 async function showLib() {
   pdf = null; cur = null; token++; disconnect();
   $("lib").hidden = false; $("view").hidden = true; $("bar").hidden = true;
-  $("back").hidden = $("mode").hidden = $("lang").hidden = true; $("addBtn").hidden = false;
+  $("back").hidden = $("mode").hidden = $("lang").hidden = $("fix").hidden = true; $("addBtn").hidden = false;
   $("title").textContent = document.title = "کتابخانه PDF";
   const list = (await req("meta", "readonly", s => s.getAll())).sort((a, b) => (b.opened || b.added) - (a.opened || a.added));
   const lib = $("lib"); lib.innerHTML = "";
@@ -155,10 +162,11 @@ async function openBook(id) {
     const meta = await req("meta", "readonly", s => s.get(id));
     const blob = await req("files", "readonly", s => s.get(id));
     pdf = await pdfjsLib.getDocument({ data: new Uint8Array(await blob.arrayBuffer()) }).promise;
+    rtlFix = await detectVisualRtl();
     cur = meta; cur.pages = pdf.numPages; cur.opened = Date.now();
     await req("meta", "readwrite", s => s.put(cur));
     $("lib").hidden = true; $("view").hidden = false; $("bar").hidden = false;
-    $("back").hidden = $("mode").hidden = $("lang").hidden = false; $("addBtn").hidden = true;
+    $("back").hidden = $("mode").hidden = $("lang").hidden = $("fix").hidden = false; $("addBtn").hidden = true;
     $("title").textContent = meta.name; document.title = meta.name;
     $("tot").textContent = pdf.numPages;
     build();
@@ -206,26 +214,71 @@ async function renderPage(n) {
   } catch (e) { rendered.delete(n); }
 }
 
-async function renderReader(page, n, div) {
-  const tc = await page.getTextContent(), paras = [];
-  let t = "", lastY = null, lastH = 10;
-  for (const it of tc.items) {
-    if (!it.str && !it.hasEOL) continue;
-    const y = it.transform[5], h = it.height || lastH;
-    if (lastY !== null) {
-      const gap = Math.abs(lastY - y);
-      if (gap > h * 1.8) { if (t.trim()) paras.push(t.trim()); t = ""; }
-      else if (gap > 2 && t && !/\s$/.test(t)) t += " ";
-    }
-    t += it.str;
-    if (it.hasEOL && t && !/[\s-]$/.test(t)) t += " ";
-    lastY = y; lastH = h;
+/* ---------- Persian/Arabic visual-order fix ---------- */
+const R_RE = /[\u0620-\u064A\u066E-\u06D3\u06FA-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/;
+const L_RE = /[A-Za-z0-9\u00C0-\u024F\u0660-\u0669\u06F0-\u06F9]/;
+const MIRROR = { "(": ")", ")": "(", "[": "]", "]": "[", "{": "}", "}": "{", "<": ">", ">": "<", "«": "»", "»": "«" };
+
+// Converts a line stored in visual (left-to-right) order back to logical order.
+function fixRtl(s) {
+  if (!R_RE.test(s)) return s;
+  const ch = [...s], n = ch.length;
+  const dir = ch.map(c => L_RE.test(c) ? "L" : R_RE.test(c) ? "R" : "N");
+  for (let i = 0; i < n;) {
+    if (dir[i] !== "N") { i++; continue; }
+    let j = i; while (j < n && dir[j] === "N") j++;
+    const a = dir[i - 1], b = dir[j], d = (a && b && a === b) ? a : "R";
+    for (let k = i; k < j; k++) dir[k] = d;
+    i = j;
   }
-  if (t.trim()) paras.push(t.trim());
+  const runs = [];
+  for (let i = 0; i < n;) { let j = i; while (j < n && dir[j] === dir[i]) j++; runs.push([dir[i], ch.slice(i, j)]); i = j; }
+  return runs.reverse().map(([d, cs]) => d === "R" ? cs.reverse().map(c => MIRROR[c] || c).join("") : cs.join("")).join("");
+}
+function isRtlText(s) {
+  let r = 0, l = 0;
+  for (const c of s) { if (R_RE.test(c)) r++; else if (/[A-Za-z]/.test(c)) l++; }
+  return r > l;
+}
+// Auto-detect: do common Persian words appear reversed in the extracted text?
+async function detectVisualRtl() {
+  const mode = $("fix").value;
+  if (mode === "on") return true;
+  if (mode === "off") return false;
+  let logical = 0, rev = 0, got = 0;
+  for (let n = 1; n <= Math.min(pdf.numPages, 15) && got < 3; n++) {
+    const tc = await (await pdf.getPage(n)).getTextContent({ disableNormalization: true });
+    const s = tc.items.map(i => i.str).join(" ").normalize("NFKC");
+    if (s.length < 200) continue; got++;
+    logical += (s.match(/(است|های|این|برای|شده|که )/g) || []).length;
+    rev += (s.match(/(تسا|یاه|نیا|یارب|هدش|هک )/g) || []).length;
+  }
+  return rev > logical;
+}
+
+async function renderReader(page, n, div) {
+  const tc = await page.getTextContent({ disableNormalization: true });
+  const lines = []; let t = "", lastY = null, lastH = 10, startsPara = false;
+  const flush = () => { if (t.trim()) lines.push({ t: t.trim(), p: startsPara }); t = ""; };
+  for (const it of tc.items) {
+    if (!it.str) continue;
+    const y = it.transform[5], h = it.height || lastH;
+    if (lastY !== null) { const gap = Math.abs(lastY - y); if (gap > 2) { flush(); startsPara = gap > h * 1.8; } }
+    t += it.str; lastY = y; lastH = h;
+  }
+  flush();
+  const paras = []; let para = "";
+  for (const l of lines) {
+    let s = rtlFix ? fixRtl(l.t) : l.t;
+    s = s.normalize("NFKC");
+    if (l.p && para) { paras.push(para); para = ""; }
+    para = para ? (/[a-z]-$/.test(para) && /^[a-z]/.test(s) ? para.slice(0, -1) + s : para + " " + s) : s;
+  }
+  if (para) paras.push(para);
   div.innerHTML = "";
   const h = document.createElement("h4"); h.setAttribute("translate", "no"); h.textContent = "صفحه " + n; div.append(h);
   if (!paras.length) { const p = document.createElement("p"); p.setAttribute("translate", "no"); p.textContent = "متنی در این صفحه نیست (احتمالاً اسکن‌شده است)."; div.append(p); }
-  for (const s of paras) { const p = document.createElement("p"); p.dir = "auto"; p.textContent = s.replace(/-\s+(?=[a-z])/g, ""); div.append(p); }
+  for (const s of paras) { const p = document.createElement("p"); p.dir = isRtlText(s) ? "rtl" : "auto"; p.textContent = s; div.append(p); }
 }
 
 async function renderOriginal(page, n, div) {
@@ -243,6 +296,7 @@ async function renderOriginal(page, n, div) {
 }
 
 $("mode").onchange = () => { localStorage.setItem("mode", $("mode").value); if (pdf) { cur.lastPage = curPage; build(); } };
+$("fix").onchange = async () => { localStorage.setItem("fix", $("fix").value); if (pdf) { rtlFix = await detectVisualRtl(); cur.lastPage = curPage; build(); } };
 $("lang").onchange = () => { localStorage.setItem("lang", $("lang").value); document.querySelectorAll(".pg, .textLayer").forEach(applyLang); };
 addEventListener("resize", () => document.querySelectorAll(".pg.original").forEach(d => d._fit && d._fit()));
 
